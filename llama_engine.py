@@ -41,17 +41,21 @@ class LLamaEngine():
                         trust_remote_code=self.model_config.trust_remote_code)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def generate(self, requests: List[Tuple[str, int, int]], 
+    def generate(self, 
+                 sys_prompt: str,
+                 requests: List[Tuple[str, int, int]], 
                  sampling_params: SamplingParams = None):
+        syspt_id = self.tokenizer.encode(sys_prompt)
         for i in tqdm(range(len(requests))):
             prompt, prompt_len, output_len = requests[i] 
-            output = self.run_seq(prompt, i, output_len, sampling_params)
-            print(f'input: {prompt}\ninput_len: {prompt_len}\n')
-            print(f'output: {output}\noutput_len: {len(output)}\n\n')
+            output = self.run_seq(prompt, syspt_id, i, output_len, sampling_params)
+            print(f'\ninput: {prompt}\ninput_len: {prompt_len}\n')
+            print(f'\noutput: {output}\noutput_len: {len(output)}\n\n')
 
-    def run_seq(self, request, request_id, output_len, 
+    def run_seq(self, request, syspt_id, request_id, output_len, 
                 sampling_params: SamplingParams = None):
         input_id = self.tokenizer.encode(request)
+        input_id = syspt_id + input_id
         seq = Sequence(request_id, request, input_id, block_size=0)   
 
         for i in range(output_len):

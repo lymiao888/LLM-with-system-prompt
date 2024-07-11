@@ -1,0 +1,1 @@
+torchrun --nproc_per_node 1 example_text_completion.py ~/lab/LLM/llama/model/llama-2-7b ~/lab/LLM/llama/model/tokenizer.model

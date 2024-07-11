@@ -35,12 +35,14 @@ def main(
         max_seq_len=max_seq_len,
         max_batch_size=max_batch_size,
     )
+    system_prompt: str = "The expected answer is the natural continuation of the prompt: "
     prompts: List[str] = [
         "I believe the meaning of life is",
-        "Simply put, the theory of relativity states that ",
+        "Simply put, the theory of relativity states that",
         "The future of AI is protential"
     ]
     results = generator.text_completion(
+        system_prompt,
         prompts,
         max_gen_len=max_gen_len,
         temperature=temperature,

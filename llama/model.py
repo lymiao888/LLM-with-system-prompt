@@ -256,6 +256,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        sys_len: int
     ):
         """
         Forward pass of the attention module.
@@ -276,15 +277,18 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
+        # xq
+        # torch.Size([3, 1, 32, 128])
+        # freqs_cis
+        # torch.Size([1, 64])
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
+        # print(xk.size()) # torch.Size([3, 1, 32, 128])
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
 
         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-
+        # print(self.cache_k.size()) # torch.Size([4, 128, 32, 128])
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
@@ -302,6 +306,35 @@ class Attention(nn.Module):
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
+    
+    # def init_sys_kv_cache(
+    #     self,
+    #     x: torch.Tensor,
+    #     freqs_cis: torch.Tensor,
+    #     sys_len: int
+    # ):
+    #     x = x[:, :sys_len, :]
+    #     bsz, seqlen, _ = x.shape
+    #     xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+    #     # print("xq")
+    #     # print(xq.size())
+    #     # # torch.Size([3, 14, 4096])
+        
+    #     xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+    #     xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+    #     xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+    #     # print("xq")
+    #     # print(xq.size()) # torch.Size([3, 14, 32, 128])
+    #     # print("freqs_cis")
+    #     # print(freqs_cis.shape)
+    #     # # torch.Size([22, 64])
+    #     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis[:seqlen,:])
+    #     # print(xk.size()) # torch.Size([3, 1, 32, 128])
+        
+    #     self.sys_cache_k = self.sys_cache_k.to(xq)
+    #     self.sys_cache_v = self.sys_cache_v.to(xq)
+        
+    #     return
 
 
 class FeedForward(nn.Module):
@@ -389,6 +422,7 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        sys_len: int
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -405,8 +439,10 @@ class TransformerBlock(nn.Module):
         """
         # h = layer(h, start_pos, freqs_cis, mask)
         # print(self.layer_id)
+        # if(self.layer_id == 0):
+        #     self.attention.init_sys_kv_cache(self.attention_norm(x), freqs_cis, sys_len)
         h = x + self.attention(
-            self.attention_norm(x) , start_pos, freqs_cis, mask
+            self.attention_norm(x) , start_pos, freqs_cis, mask, sys_len
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -456,7 +492,7 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, sys_len: int):
         """
         Perform a forward pass through the Transformer model.
 
@@ -473,7 +509,7 @@ class Transformer(nn.Module):
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         # print(freqs_cis) # torch.Size([1, 64])
-        # print(freqs_cis.size())
+
         mask = None
         if seqlen > 1:
             mask = torch.full(
@@ -491,7 +527,7 @@ class Transformer(nn.Module):
             ]).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask, sys_len)
         h = self.norm(h)
         output = self.output(h).float()
         return output

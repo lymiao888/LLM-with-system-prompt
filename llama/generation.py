@@ -129,6 +129,7 @@ class Llama:
     @torch.inference_mode()
     def generate(
         self,
+        sys_len: int,
         prompt_tokens: List[List[int]],
         max_gen_len: int,
         temperature: float = 0.6,
@@ -184,7 +185,7 @@ class Llama:
             )
 
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos, sys_len)
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -263,10 +264,12 @@ class Llama:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
         sys_tokens = self.tokenizer.encode(system_prompt, bos=True, eos=False)
+        sys_len = len(sys_tokens)
         prompt_tokens = [sys_tokens+self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
+            sys_len=sys_len,
             max_gen_len=max_gen_len,
             temperature=temperature,
             top_p=top_p,

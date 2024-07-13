@@ -81,7 +81,8 @@ class SyscacheManager:
                 self.head_dim,
             )
         ).cuda()
-
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        x = self.attention_norm(x)
         x = x[:, :sys_len, :]
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -156,10 +157,6 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
 
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
-
-    
-        
-
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -213,9 +210,6 @@ def apply_rotary_emb(
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
-
-        
-
     """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
@@ -337,8 +331,6 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-        # print(f"layer_id: {layer_id}")
-        # print(f"start_pos: {start_pos}")
         bsz, seqlen, _ = x.shape
         if mask is not None:
             xq_full = self.wq(x)
@@ -379,84 +371,20 @@ class Attention(nn.Module):
             keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
             values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
             scores = torch.matmul(xq_full, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+            output = output.transpose(1, 2).contiguous().view(bsz, sys_len+seqlen, -1)
         else:
             xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
             keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
             values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
             scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        
-        if mask is not None:
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-            output = output.transpose(1, 2).contiguous().view(bsz, sys_len+seqlen, -1)
-        else:
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
             output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+
         return self.wo(output)
-    
-    
-    # def init_sys_kv_cache(
-    #     self,
-    #     x: torch.Tensor,
-    #     freqs_cis: torch.Tensor,
-    #     sys_len: int
-    # ):
-    #     x = x[:, :sys_len, :]
-    #     bsz, seqlen, _ = x.shape
-    #     xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-    #     # print("xq")
-    #     # print(xq.size())
-    #     # # torch.Size([3, 14, 4096])
-        
-    #     xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-    #     xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-    #     xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-    #     # print("xq")
-    #     # print(xq.size()) # torch.Size([3, 14, 32, 128])
-    #     # print("freqs_cis")
-    #     # print(freqs_cis.shape)
-    #     # # torch.Size([22, 64])
-    #     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis[:seqlen,:])
-    #     # print(xk.size()) # torch.Size([3, 1, 32, 128])
-        
-    #     self.sys_cache_k = self.sys_cache_k.to(xq)
-    #     self.sys_cache_v = self.sys_cache_v.to(xq)
-        
-    #     return
-
-
-
-    # def init_sys_kv_cache(
-    #     self,
-    #     x: torch.Tensor,
-    #     freqs_cis: torch.Tensor,
-    #     sys_len: int
-    # ):
-    #     x = x[:, :sys_len, :]
-    #     bsz, seqlen, _ = x.shape
-    #     xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-    #     # print("xq")
-    #     # print(xq.size())
-    #     # # torch.Size([3, 14, 4096])
-        
-    #     xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-    #     xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-    #     xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-    #     # print("xq")
-    #     # print(xq.size()) # torch.Size([3, 14, 32, 128])
-    #     # print("freqs_cis")
-    #     # print(freqs_cis.shape)
-    #     # # torch.Size([22, 64])
-    #     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis[:seqlen,:])
-    #     # print(xk.size()) # torch.Size([3, 1, 32, 128])
-        
-    #     self.sys_cache_k = self.sys_cache_k.to(xq)
-    #     self.sys_cache_v = self.sys_cache_v.to(xq)
-        
-    #     return
 
 
 class FeedForward(nn.Module):

@@ -266,7 +266,7 @@ class Llama:
         sys_tokens = self.tokenizer.encode(system_prompt, bos=True, eos=False)
         sys_len = len(sys_tokens)
         prompt_tokens = [sys_tokens+self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
-
+        # start_time = time.time()
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
             sys_len=sys_len,
@@ -276,6 +276,7 @@ class Llama:
             logprobs=logprobs,
             echo=echo,
         )
+        # print(f"generation time {time.time() - start_time:.2f} seconds")
         if logprobs:
             return [
                 {

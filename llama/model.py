@@ -14,7 +14,7 @@ from fairscale.nn.model_parallel.layers import (
     RowParallelLinear,
 )
 from torch import nn
-
+# from llama.memory_manager import SyscacheManager
 
 @dataclass
 class ModelArgs:
@@ -31,6 +31,70 @@ class ModelArgs:
     max_seq_len: int = 2048
 
 
+class SyscacheManager:
+    def __init__(
+        self,
+        args: ModelArgs,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        sys_len: int
+    ):
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        self.head_dim = args.dim // args.n_heads
+        model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.wq = ColumnParallelLinear(
+            args.dim,
+            args.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wk = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wv = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.sys_cache_k = torch.zeros(
+            (
+                1,
+                sys_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+        self.sys_cache_v = torch.zeros(
+            (
+                1,
+                sys_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+
+        x = x[:, :sys_len, :]
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis[:seqlen,:])
+
+        self.sys_cache_k = self.sys_cache_k.to(xq)
+        self.sys_cache_v = self.sys_cache_v.to(xq)
+ 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         """
@@ -256,7 +320,9 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        sys_len: int
+        layer_id: int,
+        sys_len: int,
+        sysmem: SyscacheManager
     ):
         """
         Forward pass of the attention module.
@@ -271,42 +337,98 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
+        # print(f"layer_id: {layer_id}")
+        # print(f"start_pos: {start_pos}")
+        bsz, seqlen, _ = x.shape
+        if mask is not None:
+            xq_full = self.wq(x)
+            xk_full = self.wk(x)
+            xq_full = xq_full.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+            xk_full = xk_full.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+            xq_full, xk_full = apply_rotary_emb(xq_full, xk_full, freqs_cis=freqs_cis)
+            x = x[:, sys_len:, :]
+            freqs_cis = freqs_cis[sys_len:, :]
+        else:
+            start_pos = start_pos - sys_len
+
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
+        
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        # xq
-        # torch.Size([3, 1, 32, 128])
-        # freqs_cis
-        # torch.Size([1, 64])
+
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
         # print(xk.size()) # torch.Size([3, 1, 32, 128])
         self.cache_k = self.cache_k.to(xq)
         self.cache_v = self.cache_v.to(xq)
-
         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-        # print(self.cache_k.size()) # torch.Size([4, 128, 32, 128])
-        keys = self.cache_k[:bsz, : start_pos + seqlen]
-        values = self.cache_v[:bsz, : start_pos + seqlen]
+
+        sys_cache_k = torch.cat([sysmem.sys_cache_k] * bsz, dim=0)
+        sys_cache_v = torch.cat([sysmem.sys_cache_v] * bsz, dim=0)
+        keys = torch.cat((sys_cache_k, self.cache_k[:bsz, : start_pos + seqlen]), dim =1)
+        values = torch.cat((sys_cache_v, self.cache_v[:bsz, : start_pos + seqlen]), dim = 1)
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            xq_full = xq_full.transpose(1, 2) # (bs, n_local_heads, syslen + seqlen, head_dim)
+            keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+            values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+            scores = torch.matmul(xq_full, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        else:
+            xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+            values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        
+        if mask is not None:
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+            output = output.transpose(1, 2).contiguous().view(bsz, sys_len+seqlen, -1)
+        else:
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
     
+    
+    # def init_sys_kv_cache(
+    #     self,
+    #     x: torch.Tensor,
+    #     freqs_cis: torch.Tensor,
+    #     sys_len: int
+    # ):
+    #     x = x[:, :sys_len, :]
+    #     bsz, seqlen, _ = x.shape
+    #     xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+    #     # print("xq")
+    #     # print(xq.size())
+    #     # # torch.Size([3, 14, 4096])
+        
+    #     xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+    #     xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+    #     xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+    #     # print("xq")
+    #     # print(xq.size()) # torch.Size([3, 14, 32, 128])
+    #     # print("freqs_cis")
+    #     # print(freqs_cis.shape)
+    #     # # torch.Size([22, 64])
+    #     xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis[:seqlen,:])
+    #     # print(xk.size()) # torch.Size([3, 1, 32, 128])
+        
+    #     self.sys_cache_k = self.sys_cache_k.to(xq)
+    #     self.sys_cache_v = self.sys_cache_v.to(xq)
+        
+    #     return
+
+
+
     # def init_sys_kv_cache(
     #     self,
     #     x: torch.Tensor,
@@ -422,7 +544,8 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        sys_len: int
+        sys_len: int,
+        sysmem: SyscacheManager
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -442,7 +565,7 @@ class TransformerBlock(nn.Module):
         # if(self.layer_id == 0):
         #     self.attention.init_sys_kv_cache(self.attention_norm(x), freqs_cis, sys_len)
         h = x + self.attention(
-            self.attention_norm(x) , start_pos, freqs_cis, mask, sys_len
+            self.attention_norm(x) , start_pos, freqs_cis, mask, self.layer_id, sys_len, sysmem
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -490,7 +613,6 @@ class Transformer(nn.Module):
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
-
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int, sys_len: int):
         """
@@ -508,8 +630,11 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens) # h:把tokens[3,1]->[3,1,4096]
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        self.sysmem = SyscacheManager(self.params, h, freqs_cis, sys_len)
         # print(freqs_cis) # torch.Size([1, 64])
-
+        # x: torch.Tensor,
+        # freqs_cis: torch.Tensor,
+        # sys_len: int
         mask = None
         if seqlen > 1:
             mask = torch.full(
@@ -525,9 +650,8 @@ class Transformer(nn.Module):
                 torch.zeros((seqlen, start_pos), device=tokens.device),
                 mask
             ]).type_as(h)
-
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask, sys_len)
+            h = layer(h, start_pos, freqs_cis, mask, sys_len, self.sysmem)
         h = self.norm(h)
         output = self.output(h).float()
         return output
